@@ -1,0 +1,48 @@
+name: Deploy CloudFormation Stack
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Validate CloudFormation
+        run: |
+          pip install cfn-lint
+          cfn-lint templates/grc-agentic-core.yml
+          aws cloudformation validate-template \
+            --template-body file://templates/grc-agentic-core.yml
+
+      - name: Package Lambda functions
+        run: |
+          bash scripts/package_lambda.sh
+
+      - name: Deploy CloudFormation stack
+        run: |
+          STACK_NAME=grc-agentic-core
+          aws cloudformation deploy \
+            --stack-name $STACK_NAME \
+            --template-file templates/grc-agentic-core.yml \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides file://parameters/dev-params.json \
+            --no-fail-on-empty-changeset
+
+      - name: Post-deploy sanity checks
+        run: bash scripts/post_deploy.sh
