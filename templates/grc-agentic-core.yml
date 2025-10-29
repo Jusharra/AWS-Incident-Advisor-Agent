@@ -5,6 +5,9 @@ Parameters:
   ProjectName:
     Type: String
     Default: grc-agentic
+  NameSuffix:
+    Type: String
+    Default: dev
   VpcCidr:
     Type: String
     Default: 10.20.0.0/16
@@ -14,12 +17,6 @@ Parameters:
   PrivateSubnet2Cidr:
     Type: String
     Default: 10.20.2.0/24
-  AllowedAZ1:
-    Type: AWS::EC2::AvailabilityZone::Name
-    Default: us-east-1a
-  AllowedAZ2:
-    Type: AWS::EC2::AvailabilityZone::Name
-    Default: us-east-1b
   EvidenceRetentionDays:
     Type: Number
     Default: 365
@@ -33,8 +30,20 @@ Parameters:
     NoEcho: true
     Default: ''
     Description: Optional initial value for Supabase service key (can set later)
+  EnableBedrockVPCEndpoint:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'false'
+  EnableEvidenceObjectLock:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'false'
 
-Mappings: {}
+Conditions:
+  UseBedrockEndpoint: !Equals [ !Ref EnableBedrockVPCEndpoint, 'true' ]
+  UseObjectLock:      !Equals [ !Ref EnableEvidenceObjectLock, 'true' ]
+  HasPinecone:        !Not [ !Equals [ !Ref PineconeApiKeyString, '' ] ]
+  HasSupabase:        !Not [ !Equals [ !Ref SupabaseServiceKeyString, '' ] ]
 
 Resources:
 
@@ -51,9 +60,11 @@ Resources:
         Statement:
           - Sid: AllowRoot
             Effect: Allow
-            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
+
   KmsAlias:
     Type: AWS::KMS::Alias
     Properties:
@@ -61,7 +72,7 @@ Resources:
       TargetKeyId: !Ref KmsKey
 
   # --------------------------
-  # VPC + Subnets
+  # VPC + Subnets & routing (private only)
   # --------------------------
   Vpc:
     Type: AWS::EC2::VPC
@@ -69,32 +80,39 @@ Resources:
       CidrBlock: !Ref VpcCidr
       EnableDnsHostnames: true
       EnableDnsSupport: true
-      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
 
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
-      AvailabilityZone: !Ref AllowedAZ1
+      AvailabilityZone: !Select [0, !GetAZs '']
       CidrBlock: !Ref PrivateSubnet1Cidr
       MapPublicIpOnLaunch: false
-      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-priv-1' }]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-priv-1'
 
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
-      AvailabilityZone: !Ref AllowedAZ2
+      AvailabilityZone: !Select [1, !GetAZs '']
       CidrBlock: !Ref PrivateSubnet2Cidr
       MapPublicIpOnLaunch: false
-      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-priv-2' }]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-priv-2'
 
-  # Route tables (simple private)
   RtPrivate:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
-      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-rt-private' }]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rt-private'
 
   RtAssocPriv1:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -109,7 +127,7 @@ Resources:
       RouteTableId: !Ref RtPrivate
 
   # --------------------------
-  # VPC Endpoints (S3 Gateway + Interface for Secrets Manager and Bedrock Runtime)
+  # VPC Endpoints
   # --------------------------
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -134,7 +152,9 @@ Resources:
           FromPort: 0
           ToPort: 65535
           CidrIp: 0.0.0.0/0
-      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-ep-sg' }]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ep-sg'
 
   SecretsManagerEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -147,24 +167,25 @@ Resources:
       PrivateDnsEnabled: true
 
   BedrockRuntimeEndpoint:
+    Condition: UseBedrockEndpoint
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref Vpc
       VpcEndpointType: Interface
-      # Bedrock runtime endpoint name (supported in us-east-1)
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
       SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
       SecurityGroupIds: [ !Ref EndpointSG ]
       PrivateDnsEnabled: true
 
   # --------------------------
-  # S3 Buckets
+  # S3 Buckets (unique per env)
   # --------------------------
   RagSourcesBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub '${AWS::AccountId}-${ProjectName}-rag-sources'
-      VersioningConfiguration: { Status: Enabled }
+      BucketName: !Sub '${AWS::AccountId}-${ProjectName}-${NameSuffix}-rag-sources'
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -175,17 +196,15 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      Tags:
-        - { Key: project, Value: !Ref ProjectName }
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
 
   EvidenceBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub '${AWS::AccountId}-${ProjectName}-evidence'
-      ObjectLockEnabled: true
-      VersioningConfiguration: { Status: Enabled }
+      BucketName: !Sub '${AWS::AccountId}-${ProjectName}-${NameSuffix}-evidence'
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -196,41 +215,37 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      ObjectLockConfiguration:
-        ObjectLockEnabled: Enabled
-        Rule:
-          DefaultRetention:
-            Mode: COMPLIANCE
-            Days: !Ref EvidenceRetentionDays
-      Tags:
-        - { Key: project, Value: !Ref ProjectName }
+      ObjectLockEnabled: !If [ UseObjectLock, true, !Ref 'AWS::NoValue' ]
+      ObjectLockConfiguration: !If
+        - UseObjectLock
+        - ObjectLockEnabled: Enabled
+          Rule:
+            DefaultRetention:
+              Mode: COMPLIANCE
+              Days: !Ref EvidenceRetentionDays
+        - !Ref 'AWS::NoValue'
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
 
   # --------------------------
-  # Secrets Manager Secrets (placeholders)
+  # Secrets Manager
   # --------------------------
   PineconeApiKey:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub '${ProjectName}/pinecone/apiKey'
+      Name: !Sub '${ProjectName}/${NameSuffix}/pinecone/apiKey'
       KmsKeyId: !Ref KmsKey
-      SecretString: !If
-        - HasPinecone
-        - !Ref PineconeApiKeyString
-        - !Ref AWS::NoValue
+      SecretString: !If [ HasPinecone, !Ref PineconeApiKeyString, !Ref 'AWS::NoValue' ]
+
   SupabaseServiceKey:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub '${ProjectName}/supabase/serviceKey'
+      Name: !Sub '${ProjectName}/${NameSuffix}/supabase/serviceKey'
       KmsKeyId: !Ref KmsKey
-      SecretString: !If
-        - HasSupabase
-        - !Ref SupabaseServiceKeyString
-        - !Ref AWS::NoValue
+      SecretString: !If [ HasSupabase, !Ref SupabaseServiceKeyString, !Ref 'AWS::NoValue' ]
 
   # --------------------------
-  # IAM Roles & Policies
+  # IAM Roles
   # --------------------------
   EtlLambdaRole:
     Type: AWS::IAM::Role
@@ -239,7 +254,8 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: etl-access
@@ -250,10 +266,10 @@ Resources:
                 Effect: Allow
                 Action: [ s3:GetObject, s3:PutObject, s3:ListBucket ]
                 Resource:
-                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-rag-sources'
-                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-rag-sources/*'
-                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-evidence'
-                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-evidence/*'
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-${NameSuffix}-rag-sources'
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-${NameSuffix}-rag-sources/*'
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-${NameSuffix}-evidence'
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-${NameSuffix}-evidence/*'
               - Sid: KMS
                 Effect: Allow
                 Action: [ kms:Encrypt, kms:Decrypt, kms:GenerateDataKey* ]
@@ -276,7 +292,8 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: agent-runner
@@ -287,7 +304,7 @@ Resources:
                 Effect: Allow
                 Action: [ s3:PutObject, s3:AbortMultipartUpload ]
                 Resource:
-                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-evidence/*'
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-${ProjectName}-${NameSuffix}-evidence/*'
               - Sid: KMS
                 Effect: Allow
                 Action: [ kms:Encrypt, kms:Decrypt, kms:GenerateDataKey* ]
@@ -302,7 +319,6 @@ Resources:
                 Effect: Allow
                 Action: [ logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents ]
                 Resource: '*'
-              # Placeholders for remediation permissions (narrow per your needs)
               - Sid: ExampleRemediation
                 Effect: Allow
                 Action:
@@ -317,7 +333,8 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: states.amazonaws.com }
+            Principal:
+              Service: states.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: sfn-invoke-lambda
@@ -331,20 +348,17 @@ Resources:
                   - !GetAtt AgentRunnerLambda.Arn
 
   # --------------------------
-  # Lambdas (stub code for now)
+  # Lambdas (inline code, explicit handler; no VPC on first deploy)
   # --------------------------
   EtlLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${ProjectName}-etl'
+      FunctionName: !Sub '${ProjectName}-${NameSuffix}-etl'
       Role: !GetAtt EtlLambdaRole.Arn
       Runtime: python3.11
-      Timeout: 900
-      MemorySize: 1024
-      KmsKeyArn: !GetAtt KmsKey.Arn
-      VpcConfig:
-        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
-        SecurityGroupIds: [ !Ref EndpointSG ]
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 512
       Environment:
         Variables:
           RAG_SOURCES_BUCKET: !Ref RagSourcesBucket
@@ -353,34 +367,28 @@ Resources:
           SUPABASE_SECRET_ARN: !Ref SupabaseServiceKey
       Code:
         ZipFile: |
-          import os, json, boto3, datetime
+          import json, datetime
           def handler(event, context):
-              # Placeholder: pull docs from S3 sources, embed via Bedrock, upsert to Pinecone
-              return {"status":"ok","ts": datetime.datetime.utcnow().isoformat()}
+              return {"status": "ok", "ts": datetime.datetime.utcnow().isoformat()}
 
   AgentRunnerLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${ProjectName}-agent-runner'
+      FunctionName: !Sub '${ProjectName}-${NameSuffix}-agent-runner'
       Role: !GetAtt AgentRunnerRole.Arn
       Runtime: python3.11
-      Timeout: 900
-      MemorySize: 1024
-      KmsKeyArn: !GetAtt KmsKey.Arn
-      VpcConfig:
-        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
-        SecurityGroupIds: [ !Ref EndpointSG ]
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 512
       Environment:
         Variables:
           EVIDENCE_BUCKET: !Ref EvidenceBucket
       Code:
         ZipFile: |
-          import os, json, datetime, boto3
+          import json, datetime
           def handler(event, context):
-              # Placeholder: execute "plan/apply/verify" steps and write logs/evidence to S3
-              return {"operation": event.get("operation","plan"),
-                      "applied": event.get("operation")=="apply",
-                      "ts": datetime.datetime.utcnow().isoformat()}
+              op = (event or {}).get("operation", "plan")
+              return {"operation": op, "ts": datetime.datetime.utcnow().isoformat()}
 
   # --------------------------
   # Step Functions (Plan -> Apply -> Verify)
@@ -388,7 +396,7 @@ Resources:
   PlanApplyVerifySM:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: !Sub '${ProjectName}-plan-apply-verify'
+      StateMachineName: !Sub '${ProjectName}-${NameSuffix}-plan-apply-verify'
       RoleArn: !GetAtt StateMachineRole.Arn
       DefinitionString:
         Fn::Sub: |
@@ -425,8 +433,8 @@ Resources:
   NightlySchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub '${ProjectName}-etl-nightly'
-      ScheduleExpression: cron(0 7 * * ? *)  # 7:00 UTC daily
+      Name: !Sub '${ProjectName}-${NameSuffix}-etl-nightly'
+      ScheduleExpression: cron(0 7 * * ? *) # 07:00 UTC daily
       State: ENABLED
       Targets:
         - Arn: !GetAtt EtlLambda.Arn
@@ -439,10 +447,6 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NightlySchedule.Arn
-
-Conditions:
-  HasPinecone: { "Fn::Not": [ { "Fn::Equals": [ { Ref: PineconeApiKeyString }, "" ] } ] }
-  HasSupabase: { "Fn::Not": [ { "Fn::Equals": [ { Ref: SupabaseServiceKeyString }, "" ] } ] }
 
 Outputs:
   VpcId:
