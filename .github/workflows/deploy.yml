@@ -2,7 +2,7 @@ name: Deploy CloudFormation Stack
 
 on:
   push:
-    branches: [ main ]
+    branches: [ manual ]
   workflow_dispatch:
 
 jobs:
