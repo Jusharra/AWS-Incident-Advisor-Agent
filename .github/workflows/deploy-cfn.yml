@@ -1,4 +1,4 @@
-name: Deploy (CloudFormation via OIDC)
+name: Deploy (CloudFormation via Service Role)
 
 on:
   push:
@@ -9,8 +9,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write   # for OIDC
-  contents: read    # read repo
+  id-token: write   # OIDC
+  contents: read
 
 concurrency:
   group: cfn-${{ github.ref }}
@@ -21,17 +21,14 @@ env:
   STACK_NAME: grc-agentic-core
   TEMPLATE_FILE: templates/grc-agentic-core.yml
   CHANGESET_NAME: cs-${{ github.run_id }}
-  # Inline parameter overrides used by both CREATE and UPDATE paths
-  PARAM_OVERRIDES: >
-    ParameterKey=ProjectName,ParameterValue=grc-agentic
-    ParameterKey=EnableBedrockVPCEndpoint,ParameterValue=false
-    ParameterKey=EnableEvidenceObjectLock,ParameterValue=false
+  # Optional: parameters inline or via file checked into repo
+  PARAM_OVERRIDES: "ProjectName=grc-agentic EnableBedrockVPCEndpoint=false EnableEvidenceObjectLock=false"
 
 jobs:
   validate-and-deploy:
     runs-on: ubuntu-latest
     environment:
-      name: production           # use env protection rules for approvals
+      name: production
       url: https://console.aws.amazon.com/cloudformation/home
     steps:
       - name: Checkout
@@ -45,9 +42,8 @@ jobs:
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_CFN_DEPLOYER }}
+          role-to-assume: ${{ secrets.AWS_CFN_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: gha-${{ github.run_id }}
 
       - name: Who am I?
         run: aws sts get-caller-identity
@@ -57,30 +53,28 @@ jobs:
           aws cloudformation validate-template \
             --template-body file://${{ env.TEMPLATE_FILE }}
 
-      # Try UPDATE change set first; if stack doesn't exist, create a CREATE change set.
       - name: Create/Update Change Set
         run: |
-          set -e
-          set -o pipefail
-          if aws cloudformation describe-stacks --stack-name "${{ env.STACK_NAME }}" >/dev/null 2>&1; then
-            echo "Stack exists; creating UPDATE change set"
-            aws cloudformation create-change-set \
-              --stack-name "${{ env.STACK_NAME }}" \
-              --change-set-name "${{ env.CHANGESET_NAME }}" \
-              --change-set-type UPDATE \
-              --template-body file://${{ env.TEMPLATE_FILE }} \
-              --capabilities CAPABILITY_NAMED_IAM \
-              --parameters ${{ env.PARAM_OVERRIDES }}
-          else
-            echo "Stack does not exist; creating CREATE change set"
-            aws cloudformation create-change-set \
-              --stack-name "${{ env.STACK_NAME }}" \
-              --change-set-name "${{ env.CHANGESET_NAME }}" \
-              --change-set-type CREATE \
-              --template-body file://${{ env.TEMPLATE_FILE }} \
-              --capabilities CAPABILITY_NAMED_IAM \
-              --parameters ${{ env.PARAM_OVERRIDES }}
-          fi
+          aws cloudformation create-change-set \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }} \
+            --change-set-type UPDATE \
+            --template-body file://${{ env.TEMPLATE_FILE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameters ParameterKey=ProjectName,UsePreviousValue=false,ParameterValue=grc-agentic \
+                         ParameterKey=EnableBedrockVPCEndpoint,UsePreviousValue=false,ParameterValue=false \
+                         ParameterKey=EnableEvidenceObjectLock,UsePreviousValue=false,ParameterValue=false \
+            --role-arn ${{ secrets.CFN_SERVICE_ROLE_ARN }} || \
+          aws cloudformation create-change-set \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }} \
+            --change-set-type CREATE \
+            --template-body file://${{ env.TEMPLATE_FILE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameters ParameterKey=ProjectName,ParameterValue=grc-agentic \
+                         ParameterKey=EnableBedrockVPCEndpoint,ParameterValue=false \
+                         ParameterKey=EnableEvidenceObjectLock,ParameterValue=false \
+            --role-arn ${{ secrets.CFN_SERVICE_ROLE_ARN }}
 
       - name: Wait for Change Set
         run: |
@@ -96,6 +90,8 @@ jobs:
             --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
             --output table
 
+      # Optional manual gate inside the environment (use GitHub environment reviewers)
+
       - name: Execute Change Set
         run: |
           aws cloudformation execute-change-set \
@@ -104,7 +100,6 @@ jobs:
 
       - name: Wait for Stack
         run: |
-          # Wait for either update or create to finish successfully
           aws cloudformation wait stack-update-complete --stack-name ${{ env.STACK_NAME }} || \
           aws cloudformation wait stack-create-complete --stack-name ${{ env.STACK_NAME }}
 
