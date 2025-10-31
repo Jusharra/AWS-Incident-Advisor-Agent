@@ -1,0 +1,111 @@
+name: Deploy (CloudFormation via Service Role)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "templates/**"
+      - ".github/workflows/deploy-cfn.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+concurrency:
+  group: cfn-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: grc-agentic-core
+  TEMPLATE_FILE: templates/grc-agentic-core.yml
+  CHANGESET_NAME: cs-${{ github.run_id }}
+  # Optional: parameters inline or via file checked into repo
+  PARAM_OVERRIDES: "ProjectName=grc-agentic EnableBedrockVPCEndpoint=false EnableEvidenceObjectLock=false"
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/cloudformation/home
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: CFN Lint
+        uses: scottbrenner/cfn-lint-action@v2
+        with:
+          args: ${{ env.TEMPLATE_FILE }}
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CFN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Who am I?
+        run: aws sts get-caller-identity
+
+      - name: Validate template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://${{ env.TEMPLATE_FILE }}
+
+      - name: Create/Update Change Set
+        run: |
+          aws cloudformation create-change-set \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }} \
+            --change-set-type UPDATE \
+            --template-body file://${{ env.TEMPLATE_FILE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameters ParameterKey=ProjectName,UsePreviousValue=false,ParameterValue=grc-agentic \
+                         ParameterKey=EnableBedrockVPCEndpoint,UsePreviousValue=false,ParameterValue=false \
+                         ParameterKey=EnableEvidenceObjectLock,UsePreviousValue=false,ParameterValue=false \
+            --role-arn ${{ secrets.CFN_SERVICE_ROLE_ARN }} || \
+          aws cloudformation create-change-set \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }} \
+            --change-set-type CREATE \
+            --template-body file://${{ env.TEMPLATE_FILE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameters ParameterKey=ProjectName,ParameterValue=grc-agentic \
+                         ParameterKey=EnableBedrockVPCEndpoint,ParameterValue=false \
+                         ParameterKey=EnableEvidenceObjectLock,ParameterValue=false \
+            --role-arn ${{ secrets.CFN_SERVICE_ROLE_ARN }}
+
+      - name: Wait for Change Set
+        run: |
+          aws cloudformation wait change-set-create-complete \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }}
+
+      - name: Show changes
+        run: |
+          aws cloudformation describe-change-set \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }} \
+            --query 'Changes[].ResourceChange.{Action:Action,LogicalId:LogicalResourceId,Type:ResourceType,Replacement:Replacement}' \
+            --output table
+
+      # Optional manual gate inside the environment (use GitHub environment reviewers)
+
+      - name: Execute Change Set
+        run: |
+          aws cloudformation execute-change-set \
+            --stack-name ${{ env.STACK_NAME }} \
+            --change-set-name ${{ env.CHANGESET_NAME }}
+
+      - name: Wait for Stack
+        run: |
+          aws cloudformation wait stack-update-complete --stack-name ${{ env.STACK_NAME }} || \
+          aws cloudformation wait stack-create-complete --stack-name ${{ env.STACK_NAME }}
+
+      - name: Output Stack Values
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs" \
+            --output table
