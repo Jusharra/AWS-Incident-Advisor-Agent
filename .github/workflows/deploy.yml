@@ -1,48 +1,70 @@
-name: Deploy CloudFormation Stack
+name: Deploy Stack (manual branch)
 
 on:
   push:
     branches: [ manual ]
+    paths:
+      - "templates/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: grc-agentic-core
+  TEMPLATE_FILE: templates/grc-agentic-core.yml
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/cloudformation/home
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # separate role from deploy-cfn.yml
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-manual-${{ github.run_id }}
 
-      - name: Validate CloudFormation
-        run: |
-          pip install cfn-lint
-          cfn-lint templates/grc-agentic-core.yml
-          aws cloudformation validate-template \
-            --template-body file://templates/grc-agentic-core.yml
+      - name: Who am I?
+        run: aws sts get-caller-identity
 
-      - name: Package Lambda functions
-        run: |
-          bash scripts/package_lambda.sh
+      - name: Install cfn-lint
+        run: pipx install cfn-lint
 
-      - name: Deploy CloudFormation stack
+      - name: Lint & validate template
         run: |
-          STACK_NAME=grc-agentic-core
+          cfn-lint ${{ env.TEMPLATE_FILE }}
+          aws cloudformation validate-template --template-body file://${{ env.TEMPLATE_FILE }}
+
+      # Optional: package lambdas only if you actually upload artifacts to S3.
+      # Remove if your Lambdas use "ZipFile:" inline code.
+      # - name: Package Lambda functions
+      #   run: bash scripts/package_lambda.sh
+
+      - name: Deploy stack
+        run: |
           aws cloudformation deploy \
-            --stack-name $STACK_NAME \
-            --template-file templates/grc-agentic-core.yml \
+            --stack-name "${{ env.STACK_NAME }}" \
+            --template-file "${{ env.TEMPLATE_FILE }}" \
             --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-            --parameter-overrides file://parameters/dev-params.json \
+            --parameter-overrides \
+              ProjectName=grc-agentic \
+              EnableBedrockVPCEndpoint=false \
+              EnableEvidenceObjectLock=false \
             --no-fail-on-empty-changeset
 
-      - name: Post-deploy sanity checks
+      - name: Post-deploy checks
         run: bash scripts/post_deploy.sh
