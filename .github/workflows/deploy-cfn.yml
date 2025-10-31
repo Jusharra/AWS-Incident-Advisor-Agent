@@ -64,7 +64,7 @@ jobs:
             --parameters ParameterKey=ProjectName,UsePreviousValue=false,ParameterValue=grc-agentic \
                          ParameterKey=EnableBedrockVPCEndpoint,UsePreviousValue=false,ParameterValue=false \
                          ParameterKey=EnableEvidenceObjectLock,UsePreviousValue=false,ParameterValue=false \
-            --role-arn ${{ secrets.CFN_SERVICE_ROLE_ARN }} || \
+            --role-arn ${{ secrets.AWS_ROLE_ARN_CFN_DEPLOYER }} || \
           aws cloudformation create-change-set \
             --stack-name ${{ env.STACK_NAME }} \
             --change-set-name ${{ env.CHANGESET_NAME }} \
@@ -74,7 +74,7 @@ jobs:
             --parameters ParameterKey=ProjectName,ParameterValue=grc-agentic \
                          ParameterKey=EnableBedrockVPCEndpoint,ParameterValue=false \
                          ParameterKey=EnableEvidenceObjectLock,ParameterValue=false \
-            --role-arn ${{ secrets.CFN_SERVICE_ROLE_ARN }}
+            --role-arn ${{ secrets.AWS_ROLE_ARN_CFN_DEPLOYER}}
 
       - name: Wait for Change Set
         run: |
